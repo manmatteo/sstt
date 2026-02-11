@@ -423,6 +423,7 @@ module type Tail = sig
   type t = tail = Open | Closed | RowVar of RowVar.t
   val is_open : t -> bool
   val get_opt_var : t -> RowVar.t option
+  val equal : t -> t -> bool
 end
 
 module type FieldTy = sig
@@ -478,6 +479,16 @@ module type FieldTy = sig
 
    val fvars : t -> FieldVarSet.t
    (** [fvars t] returns the set of field variables in [t].  *)
+
+  type dnf_leaf = Absent | Ty of node
+  (** The type of leaves in the DNF of record components.
+      A leaf is either the absent field, or a field with a type. *)
+      
+   val dnf : t -> (FieldVar.t, dnf_leaf) dnf
+   (** [dnf t] returns an explicit DNF of [t] *)
+
+    val of_dnf : (FieldVar.t, dnf_leaf) dnf -> t
+    (** Builds a field type from an explicit DNF. *)
 end
 
 module type RecordAtom = sig

@@ -113,6 +113,47 @@ module FieldTy(N:Node) = struct
   let map_nodes f (n,b) = (Left.map_leaves f n, b)
 
   let hash (l, r) = Hash.(mix (Hashtbl.hash l) (Hashtbl.hash r))
+
+  type dnf_leaf = Absent | Ty of node
+
+  let split_dnf dnf =
+    List.fold_right
+      (fun (ps, ns, l) (ldnf, rdnf) ->
+        match l with
+        | Ty t -> ((ps, ns, t) :: ldnf, rdnf)
+        | Absent -> (ldnf, (ps, ns, true) :: rdnf))
+      dnf ([], [])
+
+  let of_dnf_raw dnf =
+    let ldnf, rdnf = split_dnf dnf in
+    (Left.of_dnf ldnf, Right.of_dnf rdnf)
+
+  module Comp = struct
+    type leaf = dnf_leaf
+    type atom = FieldVarAtom.t
+
+    let atom_is_valid _ = true
+    let leaf_is_empty = function
+      | Absent -> false
+      | Ty t -> N.equal t N.empty
+    let leq t1 t2 = leq (of_dnf_raw t1) (of_dnf_raw t2)
+  end
+  module Dnf = Dnf.Make(Comp)
+  let dnf (l, r) =
+    N.with_own_cache
+      (fun (l, r) ->
+        let ldnf =
+          Left.dnf l
+          |> List.map (fun (ps, ns, t) -> (ps, ns, Ty t))
+        in
+        let rdnf =
+          Right.dnf r
+          |> List.filter_map (fun (ps, ns, b) ->
+              if b then Some (ps, ns, Absent) else None)
+        in
+        (ldnf @ rdnf) |> Dnf.export |> Dnf.simplify)
+      (l, r)
+  let of_dnf dnf = N.with_own_cache (fun dnf -> Dnf.import dnf |> of_dnf_raw) dnf
 end
 
 module Tail = struct

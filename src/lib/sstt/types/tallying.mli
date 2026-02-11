@@ -8,11 +8,17 @@ type constr = Ty.t * Ty.t
     such that [Ty.leq s t].
 *)
 
+type delta = {
+    v : VarSet.t;
+    f : FieldVarSet.t;
+    r : RowVarSet.t;
+}
+
 module type VarSettings = sig
   val tcompare : Var.t -> Var.t -> int
   val fcompare : FieldVar.t -> FieldVar.t -> int
   val rcompare : RowVar.t -> RowVar.t -> int
-  val delta : VarSet.t * FieldVarSet.t * RowVarSet.t
+  val delta : delta
 end
 
 (** [tally mono constrs] returns all solutions to the tallying instance

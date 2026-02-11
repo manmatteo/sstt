@@ -1,11 +1,12 @@
 open Core
 open Sstt_utils
 
+type delta = {v : VarSet.t; f : FieldVarSet.t; r : RowVarSet.t}
 module type VarSettings = sig
   val tcompare : Var.t -> Var.t -> int
   val fcompare : FieldVar.t -> FieldVar.t -> int
   val rcompare : RowVar.t -> RowVar.t -> int
-  val delta : (VarSet.t * FieldVarSet.t * RowVarSet.t)
+  val delta : delta
 end
 
 (* module type LabelOrder = sig
@@ -57,7 +58,7 @@ module Make(VS:VarSettings) = struct
     type t = Ty.t * Var.t * Ty.t (* s ≤ α ≤ t *)
 
     module VSet = VarSet
-    let delta = VS.delta |> (fun (vset, _, _) -> vset)
+    let delta = VS.delta.v
 
     (* C1 subsumes C2 if it has the same variable
        and gives better bounds (larger lower bound and smaller upper bound)
@@ -88,7 +89,7 @@ module Make(VS:VarSettings) = struct
 
     module VSet = FieldVarSet
 
-    let delta = VS.delta |> (fun (_, fset, _) -> fset)
+    let delta = VS.delta.f
 
     let subsumes (t1, v1, t1') (t2, v2, t2') =
       VS.fcompare v1 v2 = 0 &&
@@ -219,7 +220,7 @@ module Make(VS:VarSettings) = struct
     let tsingle e =
       try tsingleton (TCS.singleton e)
       with Unsat -> empty
-    let _fsingle e =
+    let fsingle e =
       try fsingleton (FCS.singleton e)
       with Unsat -> empty
     let rec insert_aux ({types;fields} as c) l =
@@ -272,7 +273,7 @@ module Make(VS:VarSettings) = struct
   end
 
   module Toplevel = struct
-    let to_ty e = [ e ] |> VDescr.of_dnf |> Ty.of_def
+    let to_ty e  = [ e ] |> VDescr.of_dnf |> Ty.of_def
 
     let pos_var v e = (Ty.empty, v, Ty.neg (to_ty e))
 
@@ -284,7 +285,7 @@ module Make(VS:VarSettings) = struct
         match l, o_min with
         | [], None -> None
         | [], Some v -> Some (v, acc)
-        | v :: ll, _ when VarSet.mem v VS.(delta |> fun (v,_,_) -> v) -> find_min_var (v::acc) o_min ll
+        | v :: ll, _ when VarSet.mem v VS.delta.v -> find_min_var (v::acc) o_min ll
         | v :: ll, None -> find_min_var acc (Some v) ll
         | v :: ll, Some v_min ->
           if VS.tcompare v v_min < 0 then
@@ -301,6 +302,38 @@ module Make(VS:VarSettings) = struct
         else
           Some (neg_var vn (pvs, rem_neg, d))
 
+  end
+
+  module FToplevel = struct
+    let to_oty e = [ e ] |> Ty.F.of_dnf
+
+    let pos_var v e = (Ty.F.empty, v, Ty.F.neg (to_oty e))
+
+    let neg_var v e = (to_oty e, v, Ty.F.any)
+
+    (* Extract a constraint for the smallest polymorphic (not in delta) field variable of a summand *)
+    let extract_smallest (pvs, nvs, d) =
+      let rec find_min_var acc o_min l =
+        match l, o_min with
+        | [], None -> None
+        | [], Some v -> Some (v, acc)
+        | v :: ll, _ when FieldVarSet.mem v VS.delta.f ->
+          find_min_var (v::acc) o_min ll
+        | v :: ll, None -> find_min_var acc (Some v) ll
+        | v :: ll, Some v_min ->
+          if VS.fcompare v v_min < 0 then
+            find_min_var (v_min::acc) (Some v) ll
+          else find_min_var (v :: acc) o_min ll
+      in
+      match find_min_var [] None pvs, find_min_var [] None nvs with
+        None, None -> None
+      | Some (v, rem_pos), None -> Some (pos_var v (rem_pos, nvs, d))
+      | None, Some (v, rem_neg) -> Some (neg_var v (pvs, rem_neg, d))
+      | Some (vp, rem_pos), Some (vn, rem_neg) ->
+        if VS.fcompare vp vn < 0 then
+          Some (pos_var vp (rem_pos, nvs, d))
+        else
+          Some (neg_var vn (pvs, rem_neg, d))
   end
 
   module VDHash = Hashtbl.Make(VDescr)
@@ -321,6 +354,60 @@ module Make(VS:VarSettings) = struct
               CSS.cap_lazy acc (psi acc ss ts)) diff acc ss tt
       )
     in psi CSS.any ps ns ()
+  let _norm_records_directly (ps, ns) =
+    let rec new_psi r0 rvs ns =
+      let open Records.Atom in
+      let check_field r ns_rest l ty =
+        let ty_r = Records.Atom.find l r in
+        Ty.F.leq ty ty_r
+        ||
+        let updated_bindings =
+          LabelMap.add l (Ty.F.cap ty (Ty.F.neg ty_r)) r0.bindings
+        in
+        new_psi {r0 with bindings = updated_bindings} rvs ns_rest
+      in
+      match ns with
+      | [] -> false
+      | r::ns_rest ->
+        begin match r.Records.Atom.tail with
+        | Open ->
+            LabelMap.for_all (check_field r ns_rest) r0.bindings
+        | v when Records.Tail.equal v r0.tail ->
+            LabelMap.for_all (check_field r ns_rest) r0.bindings
+        | RowVar v when RowVarSet.mem v rvs ->
+            LabelMap.for_all (check_field r ns_rest) r0.bindings
+        | _ -> new_psi r0 rvs ns_rest
+        end
+    in
+    let normalize_ps ps d =
+      let intersect_fields lbl =
+        List.fold_left (fun acc a -> Ty.F.cap acc (Records.Atom.find lbl a))
+          Ty.F.any ps
+      in
+      let pos_fields =
+        LabelMap.Set.elements d |> List.map (fun lbl -> lbl, intersect_fields lbl)
+        |> LabelMap.of_list
+      in
+      let rowvars, r_tail =
+        List.fold_left
+        (fun (rvs, t) r ->
+          match r.Records.Atom.tail with
+          | Open -> rvs, t
+          | Closed -> rvs, Records.Tail.Closed
+          | RowVar v -> RowVarSet.add v rvs, t)
+        (RowVarSet.empty, Open)
+        ps
+      in
+      {Records.Atom.bindings=pos_fields; tail=r_tail}, rowvars
+    in
+    let dom = List.fold_left
+      (fun acc a -> LabelMap.Set.union acc (Records.Atom.dom a))
+        LabelMap.Set.empty (ps @ ns)
+    in
+    let r0, rvs = normalize_ps ps dom in
+    LabelMap.exists (fun _ y -> Ty.F.is_empty y) r0.bindings
+    ||
+    new_psi r0 rvs ns
   let norm t =
     let memo = VDHash.create 16 in
     let rec norm_ty t =
@@ -331,7 +418,7 @@ module Make(VS:VarSettings) = struct
         VDHash.add memo vd CSS.any;
         let res =
           if Ty.is_empty t then CSS.any
-          else if VarSet.subset (Ty.vars t) VS.(delta |> fun (v,_,_) -> v) then CSS.empty
+          else if VarSet.subset (Ty.vars t) VS.delta.v then CSS.empty
           else vd |> VDescr.dnf |> CSS.map_conj norm_summand
         in
         VDHash.remove memo vd ; res
@@ -416,9 +503,24 @@ module Make(VS:VarSettings) = struct
       norm_tuple_gen ~any:Ty.F.any ~conj:Ty.F.conj
         ~diff:Ty.F.diff ~disjoint ~norm:norm_oty n line
     and norm_oty oty =
-      (* Normalize field variables here *)
-      let n, o = Ty.F.destruct oty in
-      if o then CSS.empty else norm_ty n
+      (* TODO here using Ty.F.is_empty might lead to an uncatched GetCache effect? *)
+      let dnf = Ty.F.dnf oty in
+      (* if List.is_empty dnf then CSS.any
+      else *)
+        if FieldVarSet.subset (Ty.F.fvars oty) VS.delta.f then
+        let n, o = Ty.F.destruct oty in
+        if o then CSS.empty else norm_ty n
+      else dnf |> CSS.map_conj norm_fsummand
+
+    and norm_fsummand summand =
+      match FToplevel.extract_smallest summand with
+      | None ->
+        let (_, _, leaf) = summand in
+        begin match leaf with
+        | Ty.F.Absent -> CSS.empty
+        | Ty.F.Ty t -> norm_ty t
+        end
+      | Some cs -> CSS.fsingle cs
     in
     (*  and norm_row *)
     norm_ty t
@@ -478,7 +580,7 @@ let tally delta cs =
     let tcompare = Var.compare
     let fcompare = FieldVar.compare
     let rcompare = RowVar.compare
-    let delta = (delta, FieldVarSet.empty, RowVarSet.empty)
+    let delta = {v = delta; f = FieldVarSet.empty; r = RowVarSet.empty}
   end : VarSettings) in
   tally_with_order vs cs
 
@@ -497,7 +599,7 @@ let tally_with_priority preserve delta =
     | Some i1, Some i2 -> compare i2 i1
     let fcompare = FieldVar.compare
     let rcompare = RowVar.compare
-    let delta = (delta, FieldVarSet.empty, RowVarSet.empty)
+    let delta = {v = delta; f = FieldVarSet.empty; r = RowVarSet.empty}
   end : VarSettings)
   in
   tally_with_order cmp

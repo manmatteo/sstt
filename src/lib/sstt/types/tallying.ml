@@ -43,64 +43,90 @@ module Make(VS:VarSettings) = struct
     end
     type t = T.t * var * T.t
     val delta : VSet.t
+
+    (* C1 subsumes C2 if it has the same variable
+       and gives better bounds (larger lower bound and smaller upper bound)
+    *)
     val subsumes : t -> t -> bool
     val compare : t -> t -> int
-    val vcompare : t -> t -> int
+    val vcompare : var -> var -> int
+    type dnf_leaf
+    type dnf = (var list * var list * dnf_leaf)
+    val to_ty : dnf -> T.t
+    val pos_var : var -> dnf -> t
+    val neg_var : var -> dnf -> t
   end
 
   module TConstr : Constraint
     with type VSet.t = VarSet.t
     and type T.t  = Ty.t
     and type var = Var.t
+    and type dnf_leaf = VDescr.Descr.t
   = struct
     type var = Var.t
     module T = Ty
-    type t = Ty.t * Var.t * Ty.t (* s ≤ α ≤ t *)
+    type t = T.t * var * T.t (* s ≤ α ≤ t *)
 
     module VSet = VarSet
     let delta = VS.delta.v
 
-    (* C1 subsumes C2 if it has the same variable
-       and gives better bounds (larger lower bound and smaller upper bound)
-    *)
+    let vcompare v1 v2 = VS.tcompare v1 v2
+
     let subsumes (t1, v1, t1') (t2, v2, t2') =
-      VS.tcompare v1 v2 = 0 &&
-      Ty.leq t2 t1 && Ty.leq t1' t2'
+      vcompare v1 v2 = 0 &&
+      T.leq t2 t1 && T.leq t1' t2'
 
     let compare (t1,v1,t1') (t2,v2,t2')=
-      VS.tcompare v1 v2 |> ccmp
-        Ty.compare t1 t2 |> ccmp
-        Ty.compare t1' t2'
+      vcompare v1 v2 |> ccmp
+        T.compare t1 t2 |> ccmp
+        T.compare t1' t2'
 
-    let vcompare (_,v1,_) (_,v2,_) = VS.tcompare v1 v2
+    type dnf_leaf = VDescr.Descr.t
+    type dnf = (var list * var list * VDescr.Descr.t)
+    let to_ty e  = [ e ] |> VDescr.of_dnf |> T.of_def
+
+    let pos_var v e = (T.empty, v, T.neg (to_ty e))
+
+    let neg_var v e = (to_ty e, v, T.any)
+
   end
 
   module FConstr : Constraint
     with type VSet.t = FieldVarSet.t
     and type T.t  = Ty.F.t
     and type var = FieldVar.t
+    and type dnf_leaf = Ty.F.dnf_leaf
   = struct
     type var = FieldVar.t
     module T = struct 
       include Ty.F
       let vars = fvars
     end
-    type t = Ty.F.t * FieldVar.t * Ty.F.t
+    type t = T.t * var * T.t
 
     module VSet = FieldVarSet
 
     let delta = VS.delta.f
+    let vcompare v1 v2 = VS.fcompare v1 v2
 
     let subsumes (t1, v1, t1') (t2, v2, t2') =
-      VS.fcompare v1 v2 = 0 &&
-      Ty.F.leq t2 t1 && Ty.F.leq t1' t2'
+      vcompare v1 v2 = 0 &&
+      T.leq t2 t1 && T.leq t1' t2'
 
     let compare (t1,v1,t1') (t2,v2,t2')=
-      VS.fcompare v1 v2 |> ccmp
-        Ty.F.compare t1 t2 |> ccmp
-        Ty.F.compare t1' t2'
+      vcompare v1 v2 |> ccmp
+        T.compare t1 t2 |> ccmp
+        T.compare t1' t2'
     
-    let vcompare (_,v1,_) (_,v2,_) = VS.fcompare v1 v2
+
+    type dnf_leaf = T.dnf_leaf
+    type dnf = (var list * var list * dnf_leaf)
+
+    let to_ty e = [ e ] |> T.of_dnf
+
+    let pos_var v e = (T.empty, v, T.neg (to_ty e))
+
+    let neg_var v e = (to_ty e, v, T.any)
   end
 
   (* module RConstr : Constraint with type var := RowVar.t = struct
@@ -143,12 +169,14 @@ module Make(VS:VarSettings) = struct
       let tt = C.T.cap t t' in
       assert_sat ss tt;
       (ss, v, tt)
+    
+    let vcompare (_, v1, _) (_, v2, _) = C.vcompare v1 v2
 
     let rec add c l =
       match l with
         [] -> [ c ]
       | c' :: ll ->
-        let n = C.vcompare c c' in
+        let n = vcompare c c' in
         if n < 0 then c::l
         else if n = 0 then (merge c c')::ll
         else c' :: add c ll
@@ -158,7 +186,7 @@ module Make(VS:VarSettings) = struct
       | [],  _ -> l2
       | _, []  -> l1
       | c1::ll1, c2::ll2 ->
-        let n = C.vcompare c1 c2 in
+        let n = vcompare c1 c2 in
         if n < 0 then c1 :: cap ll1 l2
         else if n > 0 then c2 :: cap l1 ll2
         else (merge c1 c2)::cap ll1 ll2
@@ -172,7 +200,7 @@ module Make(VS:VarSettings) = struct
       | _, [] -> true
       | [], _ -> false
       | c1::ll1, c2::ll2 ->
-        let n = C.vcompare c1 c2 in
+        let n = vcompare c1 c2 in
         if n < 0 then subsumes ll1 l2
         else if n > 0 then false
         else C.subsumes c1 c2 && subsumes ll1 ll2
@@ -272,69 +300,34 @@ module Make(VS:VarSettings) = struct
     let to_list l = l
   end
 
-  module Toplevel = struct
-    let to_ty e  = [ e ] |> VDescr.of_dnf |> Ty.of_def
-
-    let pos_var v e = (Ty.empty, v, Ty.neg (to_ty e))
-
-    let neg_var v e = (to_ty e, v, Ty.any)
-
+  module Toplevel (C:Constraint) = struct
     (* Extract a constraint for the smallest polymorphic (not in delta) top-level variable of a summand *)
     let extract_smallest (pvs, nvs, d) =
       let rec find_min_var acc o_min l =
         match l, o_min with
         | [], None -> None
         | [], Some v -> Some (v, acc)
-        | v :: ll, _ when VarSet.mem v VS.delta.v -> find_min_var (v::acc) o_min ll
+        | v :: ll, _ when C.VSet.mem v C.delta -> find_min_var (v::acc) o_min ll
         | v :: ll, None -> find_min_var acc (Some v) ll
         | v :: ll, Some v_min ->
-          if VS.tcompare v v_min < 0 then
+          if C.vcompare v v_min < 0 then
             find_min_var (v_min::acc) (Some v) ll
           else find_min_var (v :: acc) o_min ll
       in
       match find_min_var [] None pvs, find_min_var [] None nvs with
         None, None -> None
-      | Some (v, rem_pos), None -> Some (pos_var v (rem_pos, nvs, d))
-      | None, Some (v, rem_neg) -> Some (neg_var v (pvs, rem_neg, d))
+      | Some (v, rem_pos), None -> Some (C.pos_var v (rem_pos, nvs, d))
+      | None, Some (v, rem_neg) -> Some (C.neg_var v (pvs, rem_neg, d))
       | Some (vp, rem_pos), Some (vn, rem_neg) ->
-        if VS.tcompare vp vn < 0 then
-          Some (pos_var vp (rem_pos, nvs, d))
+        if C.vcompare vp vn < 0 then
+          Some (C.pos_var vp (rem_pos, nvs, d))
         else
-          Some (neg_var vn (pvs, rem_neg, d))
-
+          Some (C.neg_var vn (pvs, rem_neg, d))
   end
 
-  module FToplevel = struct
-    let to_oty e = [ e ] |> Ty.F.of_dnf
-
-    let pos_var v e = (Ty.F.empty, v, Ty.F.neg (to_oty e))
-
-    let neg_var v e = (to_oty e, v, Ty.F.any)
-
-    (* Extract a constraint for the smallest polymorphic (not in delta) field variable of a summand *)
-    let extract_smallest (pvs, nvs, d) =
-      let rec find_min_var acc o_min l =
-        match l, o_min with
-        | [], None -> None
-        | [], Some v -> Some (v, acc)
-        | v :: ll, _ when FieldVarSet.mem v VS.delta.f ->
-          find_min_var (v::acc) o_min ll
-        | v :: ll, None -> find_min_var acc (Some v) ll
-        | v :: ll, Some v_min ->
-          if VS.fcompare v v_min < 0 then
-            find_min_var (v_min::acc) (Some v) ll
-          else find_min_var (v :: acc) o_min ll
-      in
-      match find_min_var [] None pvs, find_min_var [] None nvs with
-        None, None -> None
-      | Some (v, rem_pos), None -> Some (pos_var v (rem_pos, nvs, d))
-      | None, Some (v, rem_neg) -> Some (neg_var v (pvs, rem_neg, d))
-      | Some (vp, rem_pos), Some (vn, rem_neg) ->
-        if VS.fcompare vp vn < 0 then
-          Some (pos_var vp (rem_pos, nvs, d))
-        else
-          Some (neg_var vn (pvs, rem_neg, d))
-  end
+  module TToplevel = Toplevel(TConstr)
+  module FToplevel = Toplevel(FConstr)
+  (* module RToplevel = Toplevel(RConstr) *)
 
   module VDHash = Hashtbl.Make(VDescr)
   let norm_tuple_gen ~any ~conj ~diff ~disjoint ~norm n (ps, ns) =
@@ -423,7 +416,7 @@ module Make(VS:VarSettings) = struct
         in
         VDHash.remove memo vd ; res
     and norm_summand summand =
-      match Toplevel.extract_smallest summand with
+      match TToplevel.extract_smallest summand with
       | None ->
         let (_,_,d) = summand in
         norm_descr d

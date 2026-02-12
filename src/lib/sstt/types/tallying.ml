@@ -31,7 +31,7 @@ module Make(VS:VarSettings) = struct
     let compare (_:t) (_:t) = () [@@ocaml.warning "-32"]
   end
 
-  module type Constraint = sig
+  module type ConstraintBase = sig
     type var
     module VSet : Set.S with type elt = var
     module T : sig
@@ -40,21 +40,64 @@ module Make(VS:VarSettings) = struct
       val leq : t -> t -> bool
       val cup : t -> t -> t
       val cap : t -> t -> t
+      val compare : t -> t -> int
+      val empty : t
+      val neg : t -> t
+      val any : t
     end
-    type t = T.t * var * T.t
     val delta : VSet.t
+    val vcompare : var -> var -> int
+    type dnf_leaf
+    type dnf = (var list * var list * dnf_leaf)
+    val to_ty : dnf -> T.t
+  end
+
+  module type Constraint = sig
+    include ConstraintBase
+
+    (* A constraint is a triple (s ≤ α ≤ t) with lower and upper bounds for
+       the variable α *)
+    type t = T.t * var * T.t
 
     (* C1 subsumes C2 if it has the same variable
        and gives better bounds (larger lower bound and smaller upper bound)
     *)
     val subsumes : t -> t -> bool
     val compare : t -> t -> int
-    val vcompare : var -> var -> int
-    type dnf_leaf
-    type dnf = (var list * var list * dnf_leaf)
-    val to_ty : dnf -> T.t
     val pos_var : var -> dnf -> t
     val neg_var : var -> dnf -> t
+  end
+
+  module MakeConstraint(CB : ConstraintBase) : Constraint
+    with type var = CB.var
+    and type VSet.t = CB.VSet.t
+    and type T.t = CB.T.t
+    and type dnf_leaf = CB.dnf_leaf
+  = struct
+    type var = CB.var
+    module VSet = CB.VSet
+    module T = CB.T
+    type t = T.t * var * T.t
+
+    let delta = CB.delta
+    let vcompare = CB.vcompare
+
+    let subsumes (t1, v1, t1') (t2, v2, t2') =
+      vcompare v1 v2 = 0 &&
+      T.leq t2 t1 && T.leq t1' t2'
+
+    let compare (t1,v1,t1') (t2,v2,t2')=
+      vcompare v1 v2 |> ccmp
+        T.compare t1 t2 |> ccmp
+        T.compare t1' t2'
+
+    type dnf_leaf = CB.dnf_leaf
+    type dnf = CB.dnf
+    let to_ty = CB.to_ty
+
+    let pos_var v e = (T.empty, v, T.neg (to_ty e))
+
+    let neg_var v e = (to_ty e, v, T.any)
   end
 
   module TConstr : Constraint
@@ -62,72 +105,35 @@ module Make(VS:VarSettings) = struct
     and type T.t  = Ty.t
     and type var = Var.t
     and type dnf_leaf = VDescr.Descr.t
-  = struct
+  = MakeConstraint(struct
     type var = Var.t
-    module T = Ty
-    type t = T.t * var * T.t (* s ≤ α ≤ t *)
-
     module VSet = VarSet
+    module T = Ty
     let delta = VS.delta.v
-
     let vcompare v1 v2 = VS.tcompare v1 v2
-
-    let subsumes (t1, v1, t1') (t2, v2, t2') =
-      vcompare v1 v2 = 0 &&
-      T.leq t2 t1 && T.leq t1' t2'
-
-    let compare (t1,v1,t1') (t2,v2,t2')=
-      vcompare v1 v2 |> ccmp
-        T.compare t1 t2 |> ccmp
-        T.compare t1' t2'
-
     type dnf_leaf = VDescr.Descr.t
     type dnf = (var list * var list * VDescr.Descr.t)
-    let to_ty e  = [ e ] |> VDescr.of_dnf |> T.of_def
-
-    let pos_var v e = (T.empty, v, T.neg (to_ty e))
-
-    let neg_var v e = (to_ty e, v, T.any)
-
-  end
+    let to_ty e = [ e ] |> VDescr.of_dnf |> T.of_def
+  end)
 
   module FConstr : Constraint
     with type VSet.t = FieldVarSet.t
     and type T.t  = Ty.F.t
     and type var = FieldVar.t
     and type dnf_leaf = Ty.F.dnf_leaf
-  = struct
+  = MakeConstraint(struct
     type var = FieldVar.t
+    module VSet = FieldVarSet
     module T = struct 
       include Ty.F
       let vars = fvars
     end
-    type t = T.t * var * T.t
-
-    module VSet = FieldVarSet
-
     let delta = VS.delta.f
     let vcompare v1 v2 = VS.fcompare v1 v2
-
-    let subsumes (t1, v1, t1') (t2, v2, t2') =
-      vcompare v1 v2 = 0 &&
-      T.leq t2 t1 && T.leq t1' t2'
-
-    let compare (t1,v1,t1') (t2,v2,t2')=
-      vcompare v1 v2 |> ccmp
-        T.compare t1 t2 |> ccmp
-        T.compare t1' t2'
-    
-
     type dnf_leaf = T.dnf_leaf
     type dnf = (var list * var list * dnf_leaf)
-
     let to_ty e = [ e ] |> T.of_dnf
-
-    let pos_var v e = (T.empty, v, T.neg (to_ty e))
-
-    let neg_var v e = (to_ty e, v, T.any)
-  end
+  end)
 
   (* module RConstr : Constraint with type var := RowVar.t = struct
     type t = Row.t * RowVar.t * Row.t (* s ≤ α ≤ t *)

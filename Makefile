@@ -44,6 +44,7 @@ test-deps:
 	opam install ppx_expect
 
 web-deps:
+	npm install -g binaryen@125
 	opam install js_of_ocaml js_of_ocaml-ppx wasm_of_ocaml-compiler
 	cd web ; npm ci
 

@@ -135,19 +135,67 @@ module Make(VS:VarSettings) = struct
     let to_ty e = [ e ] |> T.of_dnf
   end)
 
-  (* module RConstr : Constraint with type var := RowVar.t = struct
-    type t = Row.t * RowVar.t * Row.t (* s ≤ α ≤ t *)
+  (* A "row-variable atom" is one with empty bindings and tail = RowVar ρ. *)
+  let is_row_var_atom (a : Records.Atom.t) =
+    LabelMap.bindings a.bindings |> List.is_empty &&
+    match a.tail with Records.Tail.RowVar _ -> true | _ -> false
+
+  let get_row_var_atom (a : Records.Atom.t) =
+    match a.tail with Records.Tail.RowVar v -> v | _ -> assert false
+
+  let mk_row_var_atom (v : RowVar.t) : Records.Atom.t =
+    { bindings = LabelMap.empty; tail = Records.Tail.RowVar v }
+
+  (* Separate the row-variable atoms in a DNF line *)
+  let separate_row_vars (ps, ns) =
+    let var_ps, rest_ps = List.partition is_row_var_atom ps in
+    let var_ns, rest_ns = List.partition is_row_var_atom ns in
+    let pvs = List.map get_row_var_atom var_ps in
+    let nvs = List.map get_row_var_atom var_ns in
+    (pvs, nvs, (rest_ps, rest_ns))
+[@@ocaml.warning "-32"]
+
+  (* Row variable extraction from Records.t for vars function *)
+  let rvars_of_records (r : Records.t) : RowVarSet.t =
+    let add_rvars acc atoms =
+      List.fold_left (fun acc (a : Records.Atom.t) ->
+        match a.tail with
+        | Records.Tail.RowVar v -> RowVarSet.add v acc
+        | _ -> acc) acc atoms
+    in
+    r |> Records.dnf |> List.fold_left (fun acc (ps, ns) ->
+      add_rvars (add_rvars acc ps) ns
+    ) RowVarSet.empty
+
+  (* Row constraints using MakeConstraint *)
+  module RConstr : Constraint
+    with type VSet.t = RowVarSet.t
+    and type T.t = Records.t
+    and type var = RowVar.t
+    and type dnf_leaf = (Records.Atom.t list * Records.Atom.t list)
+  = MakeConstraint(struct
+    type var = RowVar.t
     module VSet = RowVarSet
-
-    let subsumes (t1, v1, t1') (t2, v2, t2') =
-      VO.rcompare v1 v2 = 0 &&
-      Ty.leq t2 t1 && Ty.leq t1' t2'
-
-    let compare (t1,v1,t1') (t2,v2,t2')=
-      VO.rcompare v1 v2 |> ccmp
-        Ty.compare t1 t2 |> ccmp
-        Ty.compare t1' t2'
-  end *)
+    module T = struct
+      type t = Records.t
+      let vars = rvars_of_records
+      let leq = Records.leq
+      let cup = Records.cup
+      let cap = Records.cap
+      let neg = Records.neg
+      let compare = Records.compare
+      let empty = Records.empty
+      let any = Records.any
+    end
+    let delta = VS.delta.r
+    let vcompare v1 v2 = VS.rcompare v1 v2
+    type dnf_leaf = (Records.Atom.t list * Records.Atom.t list)
+    type dnf = (var list * var list * dnf_leaf)
+    let to_ty (pvs, nvs, (rest_ps, rest_ns)) =
+      let var_atoms_pos = List.map mk_row_var_atom pvs in
+      let var_atoms_neg = List.map mk_row_var_atom nvs in
+      Records.of_dnf [(var_atoms_pos @ rest_ps, var_atoms_neg @ rest_ns)]
+  end)
 
   (* As in CDuce, we follow POPL'15 but keep constraint merged:
      - A Constraint Set C, is a (sorted list of triples) (s, α, t)
@@ -227,16 +275,16 @@ module Make(VS:VarSettings) = struct
 
   module CSS = struct
     (* Constraint sets are records with each component representing 
-       the subset of constraints of a given kind (type, field or row). They
+       the subset of constraints of a given kind (type, field, and row). They
        represent the conjunction of these constraints. *)
 
     module TCS = CS(TConstr)
     module FCS = CS(FConstr)
-    (* module RCS = CS(RConstr) *)
+    module RCS = CS(RConstr)
     type constraint_set = {
       types : TCS.t;
       fields : FCS.t;
-      (* rows  : RCS.t; *)
+      rows : RCS.t;
     }
 
     (* Sets of constraint sets are ordered list of non subsumable elements.
@@ -247,36 +295,47 @@ module Make(VS:VarSettings) = struct
     type t = constraint_set list
     let empty : t = []
     let is_empty = function [] -> true | _ -> false
-    let any : t = [{ types = TCS.any; fields = FCS.any }]
-    let is_any = function [{ types; fields }] when TCS.is_any types && FCS.is_any fields -> true | _ -> false
-    let tsingleton e = [{ types = e; fields = [] }]
-    let fsingleton e = [{ types = []; fields = e }]
+    let any : t = [{ types = TCS.any; fields = FCS.any; rows = RCS.any }]
+    let is_any = function 
+      | [{ types; fields; rows }] when TCS.is_any types && FCS.is_any fields && RCS.is_any rows -> true 
+      | _ -> false
+    let tsingleton e = [{ types = e; fields = []; rows = [] }]
+    let fsingleton e = [{ types = []; fields = e; rows = [] }]
+    let rsingleton e = [{ types = []; fields = []; rows = e }]
     let tsingle e =
       try tsingleton (TCS.singleton e)
       with Unsat -> empty
     let fsingle e =
       try fsingleton (FCS.singleton e)
       with Unsat -> empty
-    let rec insert_aux ({types;fields} as c) l =
+    let rsingle e =
+      try rsingleton (RCS.singleton e)
+      with Unsat -> empty
+[@@ocaml.warning "-32"]
+    let rec insert_aux ({types;fields;rows} as c) l =
       match l with
         [] -> [c]
-      | {types=types';fields=fields'} as c' :: ll ->
+      | {types=types';fields=fields';rows=rows'} as c' :: ll ->
         let n1 = TCS.compare types types' in
         let n2 = FCS.compare fields fields' in
+        let n3 = RCS.compare rows rows' in
         if n1 < 0 then c::l
         else if n1 = 0 then
           if n2 < 0 then c::l
-          else if n2 = 0 then ll
+          else if n2 = 0 then
+            if n3 < 0 then c::l
+            else if n3 = 0 then ll
+            else c' :: insert_aux c ll
           else c' :: insert_aux c ll
-        else
-           c' :: insert_aux c ll
-    let add ({types;fields} as c) l =
+        else c' :: insert_aux c ll
+    let add ({types;fields;rows} as c) l =
       if (List.exists (fun {types=t;_} -> TCS.subsumes types t) l)
-        && (List.exists (fun {types=_;fields=f} -> FCS.subsumes fields f) l)
+        && (List.exists (fun {fields=f;_} -> FCS.subsumes fields f) l)
+        && (List.exists (fun {rows=r;_} -> RCS.subsumes rows r) l)
       then l
       else
-        List.filter (fun {types=types';fields=fields'} ->
-          (TCS.subsumes types' types && FCS.subsumes fields' fields) |> not) l
+        List.filter (fun {types=types';fields=fields';rows=rows'} ->
+          (TCS.subsumes types' types && FCS.subsumes fields' fields && RCS.subsumes rows' rows) |> not) l
         |> insert_aux c
 
     let cup t1 t2 = List.fold_left (fun acc cs -> add cs acc) t1 t2
@@ -287,6 +346,7 @@ module Make(VS:VarSettings) = struct
         let r = {
           types = TCS.cap cs1.types cs2.types;
           fields = FCS.cap cs1.fields cs2.fields;
+          rows = RCS.cap cs1.rows cs2.rows;
         } in
         add r acc
         with Unsat -> acc)
@@ -307,20 +367,22 @@ module Make(VS:VarSettings) = struct
   end
 
   module Toplevel (C:Constraint) = struct
+    let find_min_var =
+      let rec aux acc o_min l =
+      match l, o_min with
+      | [], None -> None
+      | [], Some v -> Some (v, acc)
+      | v :: ll, _ when C.VSet.mem v C.delta -> aux (v::acc) o_min ll
+      | v :: ll, None -> aux acc (Some v) ll
+      | v :: ll, Some v_min ->
+        if C.vcompare v v_min < 0 then
+          aux (v_min::acc) (Some v) ll
+        else aux (v :: acc) o_min ll
+      in aux [] None
+
     (* Extract a constraint for the smallest polymorphic (not in delta) top-level variable of a summand *)
     let extract_smallest (pvs, nvs, d) =
-      let rec find_min_var acc o_min l =
-        match l, o_min with
-        | [], None -> None
-        | [], Some v -> Some (v, acc)
-        | v :: ll, _ when C.VSet.mem v C.delta -> find_min_var (v::acc) o_min ll
-        | v :: ll, None -> find_min_var acc (Some v) ll
-        | v :: ll, Some v_min ->
-          if C.vcompare v v_min < 0 then
-            find_min_var (v_min::acc) (Some v) ll
-          else find_min_var (v :: acc) o_min ll
-      in
-      match find_min_var [] None pvs, find_min_var [] None nvs with
+      match find_min_var pvs, find_min_var nvs with
         None, None -> None
       | Some (v, rem_pos), None -> Some (C.pos_var v (rem_pos, nvs, d))
       | None, Some (v, rem_neg) -> Some (C.neg_var v (pvs, rem_neg, d))
@@ -558,7 +620,7 @@ module Make(VS:VarSettings) = struct
     in
     aux CSS.TCS.any cs
 
-  let solve {CSS.types = cs; fields = _} =
+  let solve {CSS.types = cs; _} =
     let renaming = ref Subst.identity in
     let to_eq (ty1, v, ty2) =
       let v' = Var.mk (Var.name v) in

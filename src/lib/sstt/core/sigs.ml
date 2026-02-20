@@ -624,6 +624,13 @@ module type Records = sig
   (** @inline*)
   include OptComponentOps with type t := t
                            and type atom' := Atom'.t
+
+  val cap : t -> t -> t
+  val cup : t -> t -> t
+  val neg : t -> t
+  val diff : t -> t -> t
+  val leq : t -> t -> bool
+  val is_empty : t -> bool
 end
 
 (* Tuples *)
@@ -1132,6 +1139,11 @@ module type Ty = sig
       This operation may be expensive since it calls {!equiv} internally.
   *)
 
+  (* val with_own_cache : ('a -> 'b) -> 'a -> 'b *)
+  (** [with_own_cache f x] evaluates [f x] within a scope that provides
+      a fresh cache for memoizing emptiness checks. This is needed when
+      calling low-level operations (e.g., field type leq) that may trigger
+      internal emptiness checks on type nodes. *)
 
   (** {1 Field types }*)
 (** TODO REVIEW DOC *)

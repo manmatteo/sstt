@@ -398,6 +398,19 @@ module Make(VS:VarSettings) = struct
   (* module RToplevel = Toplevel(RConstr) *)
 
   module VDHash = Hashtbl.Make(VDescr)
+  let row_field (rw : Records.Atom.t) (lbl : Label.t) (delta : RowVarSet.t) : Ty.F.t =
+  match LabelMap.find_opt lbl rw.bindings with
+  | Some _ ->
+    (* Label is explicitly in the bindings — use the actual field type *)
+    Records.Atom.find lbl rw
+  | None ->
+    (* Label is NOT in the domain of this atom *)
+    match rw.tail with
+    | RowVar rho when not (RowVarSet.mem rho delta) ->
+      let fv = FieldVar.mk_of_rowvar rho lbl in
+      Ty.F.of_dnf [([fv], [], Ty.F.Ty Ty.any)]
+    | _ -> Records.Atom.find lbl rw
+
   let norm_tuple_gen ~any ~conj ~diff ~disjoint ~norm n (ps, ns) =
     (* Same algorithm as for subtyping tuples.
        We define it outside norm below so that its type can be
@@ -531,13 +544,12 @@ module Make(VS:VarSettings) = struct
     and norm_records_directly (ps, ns) : CSS.t =
       (* let print_record fmt r = (Printer.print_ty Printer.empty_params) fmt (Ty.mk_descr (Descr.mk_record r)) in *)
       let rec psi r0 rvs ns : CSS.t =
-        let open Records.Atom in
         let check_field r ns_rest l ty =
-          let ty_r = Records.Atom.find l r in
+          let ty_r = row_field r l VS.delta.r  in
           CSS.cup
           (norm_oty (Ty.F.diff ty ty_r))
           (let updated_bindings =
-            LabelMap.add l (Ty.F.cap ty (Ty.F.neg ty_r)) r0.bindings
+            LabelMap.add l (Ty.F.cap ty (Ty.F.neg ty_r)) r0.Records.Atom.bindings
           in
           psi {r0 with bindings = updated_bindings} rvs ns_rest)
         in
@@ -549,7 +561,7 @@ module Make(VS:VarSettings) = struct
           | Open ->
               (* LabelMap.for_all (check_field r ns_rest) r0.bindings *)
               LabelMap.fold (fun acc lbl fld -> CSS.cap (check_field r ns_rest lbl fld) acc) CSS.any r0.bindings
-          | v when Records.Tail.equal v r0.tail ->
+          | v when Records.Tail.(equal v r0.tail) ->
             (* Format.printf "Enter vequal case@."; *)
               (* LabelMap.for_all (check_field r ns_rest) r0.bindings *)
               LabelMap.fold (fun acc lbl fld -> CSS.cap (check_field r ns_rest lbl fld) acc) CSS.any r0.bindings
@@ -564,7 +576,7 @@ module Make(VS:VarSettings) = struct
       in
       let normalize_ps ps d =
         let intersect_fields lbl =
-          List.fold_left (fun acc a -> Ty.F.cap acc (Records.Atom.find lbl a))
+          List.fold_left (fun acc a -> Ty.F.cap acc (row_field a lbl VS.delta.r))
             Ty.F.any ps
         in
         let pos_fields =

@@ -353,60 +353,6 @@ module Make(VS:VarSettings) = struct
               CSS.cap_lazy acc (psi acc ss ts)) diff acc ss tt
       )
     in psi CSS.any ps ns ()
-  let _norm_records_directly (ps, ns) =
-    let rec new_psi r0 rvs ns =
-      let open Records.Atom in
-      let check_field r ns_rest l ty =
-        let ty_r = Records.Atom.find l r in
-        Ty.F.leq ty ty_r
-        ||
-        let updated_bindings =
-          LabelMap.add l (Ty.F.cap ty (Ty.F.neg ty_r)) r0.bindings
-        in
-        new_psi {r0 with bindings = updated_bindings} rvs ns_rest
-      in
-      match ns with
-      | [] -> false
-      | r::ns_rest ->
-        begin match r.Records.Atom.tail with
-        | Open ->
-            LabelMap.for_all (check_field r ns_rest) r0.bindings
-        | v when Records.Tail.equal v r0.tail ->
-            LabelMap.for_all (check_field r ns_rest) r0.bindings
-        | RowVar v when RowVarSet.mem v rvs ->
-            LabelMap.for_all (check_field r ns_rest) r0.bindings
-        | _ -> new_psi r0 rvs ns_rest
-        end
-    in
-    let normalize_ps ps d =
-      let intersect_fields lbl =
-        List.fold_left (fun acc a -> Ty.F.cap acc (Records.Atom.find lbl a))
-          Ty.F.any ps
-      in
-      let pos_fields =
-        LabelMap.Set.elements d |> List.map (fun lbl -> lbl, intersect_fields lbl)
-        |> LabelMap.of_list
-      in
-      let rowvars, r_tail =
-        List.fold_left
-        (fun (rvs, t) r ->
-          match r.Records.Atom.tail with
-          | Open -> rvs, t
-          | Closed -> rvs, Records.Tail.Closed
-          | RowVar v -> RowVarSet.add v rvs, t)
-        (RowVarSet.empty, Open)
-        ps
-      in
-      {Records.Atom.bindings=pos_fields; tail=r_tail}, rowvars
-    in
-    let dom = List.fold_left
-      (fun acc a -> LabelMap.Set.union acc (Records.Atom.dom a))
-        LabelMap.Set.empty (ps @ ns)
-    in
-    let r0, rvs = normalize_ps ps dom in
-    LabelMap.exists (fun _ y -> Ty.F.is_empty y) r0.bindings
-    ||
-    new_psi r0 rvs ns
   let norm t =
     let memo = VDHash.create 16 in
     let rec norm_ty t =
@@ -465,7 +411,7 @@ module Make(VS:VarSettings) = struct
       let n = TupleComp.len tup in
       tup |> TupleComp.dnf |> CSS.map_conj (norm_tuple n)
     and norm_records r =
-      r |> Records.dnf |> CSS.map_conj norm_record
+      r |> Records.dnf |> CSS.map_conj norm_records_directly
     and norm_arrow (ps, ns) =
       let rec psi t1 t2 ps () =
         let cstr = CSS.cup_lazy (norm_ty t1) (fun () -> norm_ty t2) in
@@ -493,14 +439,14 @@ module Make(VS:VarSettings) = struct
     and norm_tag tag line =
       let tys = TagComp.line_emptiness_checks tag line in
       CSS.map_disj norm_ty tys
-    and norm_record (ps, ns) =
+    (* and norm_record (ps, ns) =
       let line, n = Records.dnf_line_to_tuple (ps, ns) in
       let disjoint s1 s2 =
         let t = Ty.F.cap s1 s2 in
         Ty.F.is_required t && Ty.F.get t |> Ty.is_empty
       in
       norm_tuple_gen ~any:Ty.F.any ~conj:Ty.F.conj
-        ~diff:Ty.F.diff ~disjoint ~norm:norm_oty n line
+        ~diff:Ty.F.diff ~disjoint ~norm:norm_oty n line *)
     and norm_oty oty =
       (* TODO here using Ty.F.is_empty might lead to an uncatched GetCache effect? *)
       let dnf = Ty.F.dnf oty in
@@ -520,6 +466,75 @@ module Make(VS:VarSettings) = struct
         | Ty.F.Ty t -> norm_ty t
         end
       | Some cs -> CSS.fsingle cs
+    and norm_records_directly (ps, ns) : CSS.t =
+      (* let print_record fmt r = (Printer.print_ty Printer.empty_params) fmt (Ty.mk_descr (Descr.mk_record r)) in *)
+      let rec psi r0 rvs ns : CSS.t =
+        let open Records.Atom in
+        let check_field r ns_rest l ty =
+          let ty_r = Records.Atom.find l r in
+          CSS.cup
+          (norm_oty (Ty.F.diff ty ty_r))
+          (let updated_bindings =
+            LabelMap.add l (Ty.F.cap ty (Ty.F.neg ty_r)) r0.bindings
+          in
+          psi {r0 with bindings = updated_bindings} rvs ns_rest)
+        in
+        match ns with
+        | [] ->
+          CSS.empty
+        | r::ns_rest ->
+          begin match r.Records.Atom.tail with
+          | Open ->
+              (* LabelMap.for_all (check_field r ns_rest) r0.bindings *)
+              LabelMap.fold (fun acc lbl fld -> CSS.cap (check_field r ns_rest lbl fld) acc) CSS.any r0.bindings
+          | v when Records.Tail.equal v r0.tail ->
+            (* Format.printf "Enter vequal case@."; *)
+              (* LabelMap.for_all (check_field r ns_rest) r0.bindings *)
+              LabelMap.fold (fun acc lbl fld -> CSS.cap (check_field r ns_rest lbl fld) acc) CSS.any r0.bindings
+          | RowVar v when RowVarSet.mem v rvs ->
+            (* Format.printf "Enter vfalse case@."; *)
+              (* LabelMap.for_all (check_field r ns_rest) r0.bindings *)
+              LabelMap.fold (fun acc lbl fld -> CSS.cap (check_field r ns_rest lbl fld) acc) CSS.any r0.bindings
+          | _ ->
+            (* Format.printf "Enter other@."; *)
+            psi r0 rvs ns_rest
+          end
+      in
+      let normalize_ps ps d =
+        let intersect_fields lbl =
+          List.fold_left (fun acc a -> Ty.F.cap acc (Records.Atom.find lbl a))
+            Ty.F.any ps
+        in
+        let pos_fields =
+          LabelMap.Set.elements d |> List.map (fun lbl -> lbl, intersect_fields lbl)
+          |> LabelMap.of_list
+        in
+        let rowvars, r_tail =
+          List.fold_left
+          (fun (rvs, t) r ->
+            match r.Records.Atom.tail with
+            | Open -> rvs, t
+            | Closed -> rvs, Records.Tail.Closed
+            | RowVar v -> RowVarSet.add v rvs, t)
+          (RowVarSet.empty, Open)
+          ps
+        in
+        {Records.Atom.bindings=pos_fields; tail=r_tail}, rowvars
+    in
+    let dom = List.fold_left
+      (fun acc a -> LabelMap.Set.union acc (Records.Atom.dom a))
+        LabelMap.Set.empty (ps @ ns)
+    in
+    let r0, rvs = normalize_ps ps dom in
+      (* (LabelMap.exists (fun _ y -> Ty.F.is_empty y) r0.bindings)
+         ||
+         psi r0 rvs ns *)
+      CSS.cup
+      (LabelMap.fold (fun acc _lbl fld ->
+      CSS.cup acc (norm_oty fld))
+      CSS.empty
+      r0.bindings)
+     (psi r0 rvs ns)
     in
     (*  and norm_row *)
     norm_ty t

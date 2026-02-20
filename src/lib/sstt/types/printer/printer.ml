@@ -531,12 +531,12 @@ let rec print_descr prec assoc fmt d =
       in
       let print_tail fmt t =
         begin match t with
-          | Open -> Format.fprintf fmt ".."
-          | Closed -> Format.fprintf fmt ""
-          | RowVar v -> Format.fprintf fmt "%a" RowVar.pp v
-        end
+        | Open -> Format.fprintf fmt ".."
+        | Closed -> Format.fprintf fmt ""
+        | RowVar v -> Format.fprintf fmt "%a" RowVar.pp v
+      end
       in
-      fprintf fmt "{@ %a@ %a}"
+      fprintf fmt "@[<hov 0>{ %a %a}@]"
         (Prec.print_seq print_binding " ;@ ")
         bindings
         print_tail tail

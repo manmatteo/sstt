@@ -438,7 +438,21 @@ module Make(VS:VarSettings) = struct
         VDHash.add memo vd CSS.any;
         let res =
           if Ty.is_empty t then CSS.any
-          else if VarSet.subset (Ty.vars t) VS.delta.v then CSS.empty
+          else if VarSet.subset (Ty.vars t) VS.delta.v then
+              let has_polymorphic_rf_vars =
+              vd |> VDescr.dnf |> List.exists (fun (_, _, d) ->
+                let (cs, _) = d |> Descr.components in
+                List.exists (function
+                  | Descr.Records c ->
+                    let rvars = rvars_of_records c in
+                    not (RowVarSet.subset rvars VS.delta.r)
+                  | _ -> false) cs
+              )
+            in
+            if has_polymorphic_rf_vars then
+              vd |> VDescr.dnf |> CSS.map_conj norm_summand
+            else
+            CSS.empty
           else vd |> VDescr.dnf |> CSS.map_conj norm_summand
         in
         VDHash.remove memo vd ; res
